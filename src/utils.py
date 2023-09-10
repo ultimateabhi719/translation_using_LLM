@@ -65,11 +65,12 @@ def collate_tokens(batch, get_from_tokens, get_to_tokens):
     return out
 
 
-def save_model(x0, model, optimizer, save_path):
+def save_model(x0, model, optimizer, scheduler, save_path):
     torch.save({
             'x0': x0,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict' : scheduler.state_dict()
             }, save_path)
 
 
