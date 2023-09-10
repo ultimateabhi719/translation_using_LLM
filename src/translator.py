@@ -50,7 +50,7 @@ def train_one_epoch(model, device, train_loader, loss_fn, optimizer, epoch, log_
         loss = loss_fn(predictions[:, :-1, :].contiguous().view(-1, predictions.shape[-1]), toLang_input_ids[:, 1:].contiguous().view(-1))
 
         loss.backward()
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         epoch_loss += loss.item()
