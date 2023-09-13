@@ -3,11 +3,9 @@
 
 Implemented Translation Model training using the BERT pretrained model from HuggingFace.
 
-To train the model with default parameters run `python src/translator.py train`
+To train the model with default parameters run `python src/translator.py train`. To evaluate the model : `python src/translator.py eval --resume_dir <resume-dir>`
 
-To evaluate the model : `python src/translator.py eval --resume_dir <resume-dir>`
-
-For more info look at the file `src/translator.py`. To see the options : ```python src/translator.py -h```
+For more info look at the file `src/translator.py`. For a bare-minimum implementation see : `src/en-de.py`
 
 ## Train/Eval Options
 
