@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.text import BLEUScore
 
 from datasets import load_dataset
 import transformers
@@ -51,7 +52,7 @@ def build_model(model_params, device, resume_file = None):
         assert not model_params['freeze_decEmbedOnly'], "specify only one of `freeze_decEmbedOnly` or `freeze_encOnly`"
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=model_params['init_lr'])
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=model_params['gamma'], patience=model_params['patience'], verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=model_params['gamma'], patience=model_params['patience'], min_lr= model_params['min_lr'],verbose=True)
 
     ## Load model and optimizer from resume_dir
     x0 = 0
@@ -71,27 +72,36 @@ def build_model(model_params, device, resume_file = None):
     return fromLang_tokenizer, toLang_tokenizer, model, optimizer, scheduler, x0
 
 
-def show_results(model, fromLang_tokenizer, toLang_tokenizer, data_loader, limit = 20):
-    model.eval()
-    device = model.device
+@torch.no_grad()
+def eval(model, test_loader, maxlen, toLang_tokenizer, nbeams=20, num_returns=3, limit=20):
+    bleu = BLEUScore(n_gram=3)
+
     count = 0
-    for i, data in enumerate(itertools.islice(data_loader, limit)):
-        in_tokens = data['lang_from']['input_ids']
-        out_tokens = data['lang_to']['input_ids']
+    bleu_score = 0
+    for i, data in enumerate(tqdm(test_loader, desc=f'eval', leave=False)):
+        out = model.generate(data['lang_from']['input_ids'].to(model.device), max_length=maxlen, num_beams=nbeams, num_return_sequences=num_returns, do_sample=False)
 
-        out = model.generate(in_tokens.to(device))
-        predictions = zip(list(map(toLang_tokenizer.decode, out)), 
-                          list(map(toLang_tokenizer.decode, out_tokens)),
-                          list(map(fromLang_tokenizer.decode, in_tokens)))
-        for p in predictions:
+        sep_idx = torch.argmax((out == toLang_tokenizer.sep_token_id).to(dtype=torch.int), dim=-1).tolist()
+        out_text = []
+        for i, idx in enumerate(sep_idx):
+            out_text.append(toLang_tokenizer.decode(out[i,1:idx]))
+
+        target = data['lang_to']['input_ids']
+        sep_idx = torch.argmax((target == toLang_tokenizer.sep_token_id).to(dtype=torch.int), dim=-1).tolist()
+
+        for idx in range(target.shape[0]):
+            target_idx = toLang_tokenizer.decode(target[idx,1:sep_idx[idx]])
+            out_idx = out_text[idx*num_returns:(idx+1)*num_returns]
+            bleu_score += bleu(out_idx,[[target_idx]])
+            if count<=limit:
+                print(target_idx)
+                print(out_idx)
+                print()
             count += 1
-            print(*p, sep='\n')
-            print()
-        if count>=limit:
-            break
+    return bleu_score/len(test_loader)
 
 
-def train_one_epoch(model, optimizer, scheduler, scheduler_freq, loss_fn, train_loader, epoch, log_writer = None, x0=0, running_loss=0):
+def train_one_epoch(model, optimizer, scheduler, scheduler_freq, loss_fn, train_loader, epoch, save_freq, log_writer = None, x0=0, running_loss=0, model_savefmt=None):
     model.train()
     epoch_loss = 0
     device = model.device
@@ -126,6 +136,11 @@ def train_one_epoch(model, optimizer, scheduler, scheduler_freq, loss_fn, train_
             pbar.set_postfix(loss=f'{running_loss/scheduler_freq:.2f}', lr = f"{optimizer.param_groups[0]['lr']:.1e}")
             running_loss = 0
 
+        if model_savefmt and (step-x0)%save_freq == 0:
+            save_model(step, model, optimizer, scheduler, model_savefmt.format(epoch,i+1))
+            old_files = natsorted(glob.glob(model_savefmt.format('*','*')))[:-1]
+            list(map(os.remove,old_files))
+
         if log_writer:
             log_writer.add_scalar('training loss', loss.item(), step)
 
@@ -133,14 +148,16 @@ def train_one_epoch(model, optimizer, scheduler, scheduler_freq, loss_fn, train_
 
 
 def main(mode, model_params, data_params, train_params):
+    model_savefmt = os.path.join(train_params['save_prefix'],train_params['save_format']) if train_params['save_prefix'] else None
     if train_params['save_prefix']:
         os.makedirs(train_params['save_prefix'], exist_ok = True)
         torch.save([model_params, data_params, train_params],os.path.join(train_params['save_prefix'],'params.pth'))
 
     ## Build Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(train_params['device'] if torch.cuda.is_available() else "cpu")
     resume_file = natsorted(glob.glob(os.path.join(train_params['resume_dir'],train_params['save_format'].format('*','*'))))[-1] if train_params['resume_dir'] else None
     fromLang_tokenizer, toLang_tokenizer, model, optimizer, scheduler, x0 = build_model(model_params, device, resume_file=resume_file)
+    x0 = x0 if train_params['x0']<0 else train_params['x0']
 
     ## Data
     train_dataset = TransformerDataset(data_params, 'train', fromLang_tokenizer, toLang_tokenizer, max_len = train_params['maxlen'], subset = train_params['subset'])
@@ -150,7 +167,7 @@ def main(mode, model_params, data_params, train_params):
                                                collate_fn = lambda b:collate_tokens(b, (fromLang_tokenizer, data_params['lang'][0]), (toLang_tokenizer, data_params['lang'][1])))
     test_dataset = TransformerDataset(data_params, 'test', fromLang_tokenizer, toLang_tokenizer, max_len = train_params['maxlen'], subset = train_params['subset_eval'])
     test_loader = torch.utils.data.DataLoader(test_dataset, 
-                                               batch_size=train_params['batch_size'], 
+                                               batch_size=train_params['batch_size']//8, 
                                                shuffle=True, 
                                                collate_fn = lambda b:collate_tokens(b, (fromLang_tokenizer, data_params['lang'][0]), (toLang_tokenizer, data_params['lang'][1])))
 
@@ -161,13 +178,12 @@ def main(mode, model_params, data_params, train_params):
         loss_fn = nn.CrossEntropyLoss(ignore_index=toLang_tokenizer.pad_token_id)
         running_loss = 0
         for epoch in range(train_params['num_epochs']):
-            train_epoch_loss, running_loss = train_one_epoch(model, optimizer, scheduler, train_params['scheduler_freq'], loss_fn, train_loader, epoch, 
-                                               log_writer=writer, x0=x0, running_loss=running_loss)
+            train_epoch_loss, running_loss = train_one_epoch(model, optimizer, scheduler, train_params['scheduler_freq'], loss_fn, train_loader, epoch, train_params['save_freq'],
+                                                             log_writer=writer, x0=x0, running_loss=running_loss, model_savefmt=model_savefmt)
             print("epoch {epoch:>{width}}: train_loss {train_loss:.3f}".format(epoch=epoch,train_loss=train_epoch_loss,width=3))
 
             if train_params['save_prefix']:
-                model_savepath = os.path.join(train_params['save_prefix'],train_params['save_format']).format(epoch,'N')
-                save_model(x0 + epoch * len(train_loader), model, optimizer, scheduler, model_savepath)
+                save_model(x0 + epoch * len(train_loader), model, optimizer, scheduler, model_savefmt.format(epoch,'N'))
                 old_files = natsorted(glob.glob(os.path.join(train_params['save_prefix'],train_params['save_format'].format('*','*'))))[:-1]
                 list(map(os.remove,old_files))
 
@@ -175,9 +191,7 @@ def main(mode, model_params, data_params, train_params):
             writer.close()
             
     ## Eval
-    elif mode == 'eval':    
-        show_results(model, fromLang_tokenizer, toLang_tokenizer, test_loader, limit = 20)
-
+    print("bleu score", eval(model, test_loader, train_params['maxlen'], toLang_tokenizer, nbeams=20, num_returns=3))
 
 if __name__ == "__main__":
     model_params = {
@@ -192,6 +206,7 @@ if __name__ == "__main__":
 
                     # optimizer & schduler options
                     'init_lr' : 2e-4,
+                    'min_lr' : 1e-6,
                     'gamma' : 0.5,
                     'patience' : 2
                  }
@@ -205,18 +220,20 @@ if __name__ == "__main__":
                     # data subsetting options
                     'maxlen' : 76,
                     'subset' : 288,
+                    'subset_eval' : 0,
 
                     # training options
                     'batch_size' : 24,
                     'num_epochs' : 30,
-                    'subset_eval' : None,
                     'scheduler_freq' : 12,
                     'device' : 'cuda:0',
 
                     # checkpoint options
                     'save_prefix' : None,#'runs/en_de/overfit',
                     'resume_dir' : None,#'runs/en_de/log3_maxlen76_subset25k',
-                    'save_format' : "translator_epoch_{}_batch_{}.pth"
+                    'save_freq' : 1000,
+                    'x0' : -1,
+                    'save_format' : "translator_epoch_{}_batch_{}.pth",
                     }
 
     parser = argparse.ArgumentParser(description='translator_{}_{}'.format(*data_params['lang']))
@@ -226,6 +243,8 @@ if __name__ == "__main__":
             parser.add_argument('--'+k, default=train_params[k], action='store_true')
         elif isinstance(train_params[k], type(None)) or isinstance(train_params[k], str):
             parser.add_argument('--'+k, default=train_params[k], type=lambda x : None if x == 'None' else str(x))
+        elif k=='subset':
+            parser.add_argument('--'+k, default=train_params[k], type=lambda x : None if x == 'None' else int(x))
         else:
             parser.add_argument('--'+k, default=train_params[k], type=type(train_params[k]))
     for k in model_params.keys():

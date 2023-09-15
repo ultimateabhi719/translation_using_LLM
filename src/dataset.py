@@ -19,7 +19,7 @@ class TransformerDataset(Dataset):
     """
         split : 'train', 'validation', 'test'
     """
-    def __init__(self, data_params, split, from_tokenizer, to_tokenizer, max_len = None, subset = None, randomize_subset=True, random_seed=0):
+    def __init__(self, data_params, split, from_tokenizer, to_tokenizer, max_len = 0, subset = 0, randomize_subset=True, random_seed=0):
         if data_params['dataset_path'][0] == "local":
             self.dataset = load_from_disk(*data_params['dataset_path'][1])[split]
         else:
